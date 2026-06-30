@@ -1,0 +1,1893 @@
+---
+title: "Asociacion de variables mediante análisis de regresión generalizado y análisis factorial multivariante"
+author: "David Palomino Plantón"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    fig_width: 6.8
+    fig_height: 4.5
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  dpi        = 300,
+  fig.width  = 5.5,
+  fig.height = 3.5,
+  out.width  = "75%",
+  fig.align  = "center"
+)
+
+library(ggplot2)
+theme_set(
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title   = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.title   = element_text(size = 11),
+    axis.text    = element_text(size = 9),
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9),
+    strip.text   = element_text(size = 10)
+  )
+)
+```
+
+
+
+# Inserción y procesado de los datos
+
+En primer lugar, introduciremos en R los dos dataframes que hemos creado con los datos de SAA junto con los datos clínicos, geneticos y demográficos para 24h/150h
+
+```{r}
+library(readr)
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+library(patchwork)
+library(logistf)
+library(dplyr)
+library(ggforce)
+library(missMDA)
+library(ggrepel)   # etiquetas sin flechas en gráficos de variables cualitativas
+library(corrplot)  # matriz de correlación
+library(tidyr)     # pivot_longer para la matriz de correlación
+
+
+plot_contrib_es <- function(res, axes = 1, titulo = NULL, top = 6) {
+  p <- fviz_contrib(
+    res,
+    choice = "var",
+    axes = axes,
+    top = top
+  )
+
+  # Quedarse solo con las top variables ya filtradas por fviz_contrib
+  dat <- p$data
+  dat <- dat[order(dat$contrib, decreasing = TRUE)[seq_len(min(top, nrow(dat)))], ]
+  dat$etiqueta <- paste0(round(dat$contrib, 1), "%")
+
+  p +
+    geom_text(
+      data = dat,
+      aes(label = etiqueta),
+      vjust = -0.4,
+      size = 2.8,
+      color = "gray20"
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult = c(0, 0.22))
+    ) +
+    theme(
+      axis.text.x  = element_text(size = 8.5, angle = 40, hjust = 1,
+                                  color = "gray10", face = "bold"),
+      axis.text.y  = element_text(size = 8,   color = "gray20"),
+      axis.title   = element_text(size = 9,   color = "gray10"),
+      plot.title   = element_text(size = 10,  face = "bold", hjust = 0.5,
+                                  color = "gray10"),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = titulo,
+      x = NULL,
+      y = "Contribución (%)"
+    )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Función: gráfico de categorías cualitativas coloreado por variable con leyenda
+# Sustituye únicamente a fviz_famd_var(..., "quali.var", col.var = "contrib/cos2")
+# El resto del código (scree plots, fviz_contrib, etc.) no se toca
+# ─────────────────────────────────────────────────────────────────────────────
+obtener_quali_coords_famd <- function(res.famd) {
+  quali_coords <- as.data.frame(res.famd$quali.var$coord[, 1:2])
+  colnames(quali_coords) <- c("Dim1", "Dim2")
+  quali_coords$categoria_original <- rownames(quali_coords)
+
+  var_info <- res.famd$call$X
+  factor_vars <- names(var_info)[sapply(var_info, is.factor)]
+
+  mapa_categorias <- data.frame(
+    variable = rep(factor_vars, times = sapply(var_info[factor_vars], nlevels)),
+    categoria_limpia = unlist(lapply(var_info[factor_vars], levels), use.names = FALSE),
+    stringsAsFactors = FALSE
+  )
+
+  mapa_categorias$categoria_original <- make.unique(mapa_categorias$categoria_limpia)
+
+  quali_coords %>%
+    left_join(mapa_categorias, by = "categoria_original") %>%
+    mutate(
+      variable = ifelse(is.na(variable), "Variable no identificada", variable),
+      categoria_limpia = ifelse(is.na(categoria_limpia), categoria_original, categoria_limpia),
+      categoria = paste0(variable, ": ", categoria_limpia)
+    )
+}
+
+plot_quali_by_var <- function(res.famd, titulo = "") {
+  coords <- obtener_quali_coords_famd(res.famd)
+  n_vars <- length(unique(na.omit(coords$variable)))
+
+  ggplot(coords, aes(x = Dim1, y = Dim2, color = variable, label = categoria)) +
+    geom_point(size = 3, alpha = 0.8) +
+    ggrepel::geom_text_repel(
+      size          = 3.5,
+      max.overlaps  = 20,
+      segment.size = 0.3,
+      segment.color = "gray60"
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_manual(
+      values   = scales::hue_pal()(n_vars),
+      name     = "Variable",
+      na.value = "gray70"
+    ) +
+    labs(
+      title = titulo,
+      x     = paste0("Dim1 (", round(res.famd$eig[1, 2], 1), "%)"),
+      y     = paste0("Dim2 (", round(res.famd$eig[2, 2], 1), "%)")
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+# Función auxiliar para localizar los CSV traducidos al español.
+# Busca primero en el directorio de trabajo, después junto al Rmd y, por último, en /mnt/data.
+# Acepta varios nombres alternativos para que funcione también con los archivos descargados como "(1)".
+ruta_csv <- function(nombres) {
+  input_rmd <- tryCatch(knitr::current_input(dir = TRUE), error = function(e) NULL)
+
+  for (nombre in nombres) {
+    if (file.exists(nombre)) return(nombre)
+
+    if (!is.null(input_rmd)) {
+      ruta_rmd <- file.path(dirname(input_rmd), nombre)
+      if (file.exists(ruta_rmd)) return(ruta_rmd)
+    }
+
+    ruta_mnt <- file.path("/mnt/data", nombre)
+    if (file.exists(ruta_mnt)) return(ruta_mnt)
+  }
+
+  stop(paste(
+    "No se encuentra ninguno de estos archivos:",
+    paste(nombres, collapse = ", "),
+    "Coloca el CSV en el directorio de trabajo o junto a este Rmd."
+  ))
+}
+
+df_150 = read_csv("C:/Users/david/Desktop/master/TFM/CSV/df_150_score_imputado_ES.csv")
+df_24 = read_csv("C:/Users/david/Desktop/master/TFM/CSV/df_24_score_imputado_ES.csv")
+#df_24 <- na.omit(df_24)
+#df_150 <- na.omit(df_150)
+
+```
+
+Especificamos cuales son las variables nominales en nuestros datos
+
+```{r}
+
+vars_nominales <- c(
+  "grupo de estudio",
+  "sexo",
+  "raza",
+  "etnia",
+  "mutación GBA",
+  "mutación LRRK2",
+  "mutación SNCA",
+  "mutación APOE_E4",
+  "mutación EP"
+)
+```
+
+
+
+```{r}
+#Eliminamos las variables que no nos son de ninguna utilidad una vez rehecha la variable grupo de edad
+
+df_24 <- df_24[, -c(1,2,3,4,5)]
+df_150 <- df_150[, -c(1,2,3,4,5)]
+```
+
+Ahora lo representamos mediante un gráfico de barras para ver la representación visual de la distribución de edad de los distintos pacientes en nuestros datos
+
+```{r}
+orden <- c("<50", "50-59", "60-69", "70-79", "≥80")
+
+df_24$`grupo de edad` <- factor(df_24$`grupo de edad`, levels = orden)
+df_150$`grupo de edad` <- factor(df_150$`grupo de edad`, levels = orden)
+
+p1 <- ggplot(df_24, aes(x = `grupo de edad`)) +
+  geom_bar(fill = "#1f77b4") +  # azul
+  ggtitle("df_24") +
+  xlab("Grupo de edad") +
+  ylab("Frecuencia") +
+  theme_minimal()
+
+p2 <- ggplot(df_150, aes(x = `grupo de edad`)) +
+  geom_bar(fill = "#ff7f0e") +  # naranja
+  ggtitle("df_150") +
+  xlab("Grupo de edad") +
+  ylab("Frecuencia") +
+  theme_minimal()
+
+p1 + p2
+```
+
+
+Ahora convertiremos la variable estado SAA en factor debido a que es nuestra variable respuesta.
+
+```{r}
+df_150$Y <- df_150$`estado SAA`
+df_150$`estado SAA` <- NULL
+df_24$Y <- df_24$`estado SAA`
+df_24$`estado SAA` <- NULL
+
+```
+
+# Análisis de regresión generalizada
+
+Pasamos las variables cualitativas a factor.
+
+```{r}
+
+df_150 <- df_150 %>%
+  mutate(across(where(is.character), as.factor))
+
+df_24 <- df_24 %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+Ejecutamos el análisis de regresión generalizada:
+
+150h:
+```{r}
+modelo_glm150 <- glm(
+  Y ~ .,
+  family = binomial,
+  data = df_150
+)
+
+summary(modelo_glm150)
+```
+
+24h:
+```{r}
+modelo_glm24 <- glm(
+  Y ~ .,
+  family = binomial,
+  data = df_24
+)
+
+summary(modelo_glm24)
+```
+# Análisis de regresión logística penalizada (firth)
+
+Como en la regresión generalizada obtenemos algunas variables con separación perfecta (la variable predice casi perfectamente SAA_positivo o negativo) que hace que muchos de los resultados no sean válidos, vamos a realizar también un análisis de regresión logística penalizada, que debería corregir el problema de estimación y arrojar unos resultados más fiables.
+
+
+```{r}
+modelo_firth24 <- logistf(Y ~ ., data = df_24)
+summary(modelo_firth24)
+```
+
+El análisis de regresión logística penalizada muestra que la variable grupo de estudio, en particular la categoría Prodrómico, se asocia significativamente con el estado SAA positivo. Asimismo, la edad emerge como un factor relevante, observándose una disminución significativa de la probabilidad de SAA positivo en los grupos de mayor edad. En contraste, las variables genéticas y clínicas no alcanzan significación estadística en este modelo, lo que sugiere que su contribución podría depender del tamaño muestral o de efectos más complejos no capturados en este análisis.
+
+
+```{r}
+modelo_firth150 <- logistf(Y ~ ., data = df_150)
+summary(modelo_firth150)
+```
+
+En el dataset de 150 horas, al contar con mayor número de individuos (n = 1045), se detectan varias asociaciones significativas. Dentro de grupo de estudio, los grupos Cohorte genética no afectada (coef = -3.85, p ≈ 0) reduce significativamente la probabilidad de SAA positivo. Entre las variables demográficas, el grupo de edad >80 (coef = -2.33, p = 0.004) alcanza la significación estadística, siendo este último el que más reduce la probabilidad de SAA positivo entre los grupos de edad. En el límite de la significación se encuentra la puntuación MoCA (p = 0.058) y grupo de estudioEP (coef = 2.20, p = 0.059) aumentando la probabilidad de SAA positivo. Las mutaciones LRRK2, SNCA, APOE y mutación EP, así como el resto de variables demográficas y clínicas, no alcanzan la significación estadística.
+
+## Forest plot de modelo Firth
+
+```{r, fig.width=4.2, fig.height=3.8}
+forest_firth <- function(modelo, titulo = "") {
+
+  coef_df <- data.frame(
+    variable = names(coef(modelo)),
+    OR       = exp(coef(modelo)),
+    lower    = exp(modelo$ci.lower),
+    upper    = exp(modelo$ci.upper),
+    p        = modelo$prob
+  ) %>%
+    filter(variable != "(Intercept)") %>%
+    mutate(
+      significativo = ifelse(p < 0.05, "p < 0.05", "p \u2265 0.05"),
+      variable = variable %>%
+        gsub("`", "", .) %>%
+        gsub("grupo de estudio", "G.estudio: ", .) %>%
+        gsub("grupo de edad",    "Edad: ", .) %>%
+        gsub("raza",  "Raza: ", .) %>%
+        gsub("etnia", "Etnia: ", .) %>%
+        gsub("sexoHombre", "Sexo: Hombre", .) %>%
+        gsub("sexoMujer",  "Sexo: Mujer", .) %>%
+        gsub("mutacion_",  "Mut. ", .) %>%
+        gsub("mutación ",  "Mut. ", .) %>%
+        gsub("valor ",     "Val. ", .) %>%
+        gsub("Estadio Hoehn & Yahr", "Hoehn & Yahr", .) %>%
+        trimws()
+    ) %>%
+    arrange(OR)
+
+  ggplot(coef_df, aes(x = OR, y = reorder(variable, OR),
+                      color = significativo)) +
+    geom_point(size = 2.0) +
+    geom_errorbarh(aes(xmin = lower, xmax = upper),
+                   height = 0.25, linewidth = 0.55) +
+    geom_vline(xintercept = 1, linetype = "dashed",
+               color = "gray30", linewidth = 0.4) +
+    scale_color_manual(
+      values = c("p < 0.05" = "#C00000", "p \u2265 0.05" = "gray50"),
+      name   = NULL
+    ) +
+    scale_x_log10(expand = expansion(mult = c(0.12, 0.12))) +
+    labs(title = titulo,
+         x = "Odds Ratio (escala log.)",
+         y = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text.y        = element_text(size = 9,  color = "gray10"),
+      axis.text.x        = element_text(size = 9,  color = "gray10"),
+      axis.title.x       = element_text(size = 9.5, color = "gray10"),
+      plot.title         = element_text(size = 11, face = "bold",
+                                        hjust = 0.5, color = "gray10"),
+      legend.position    = "bottom",
+      legend.text        = element_text(size = 9),
+      legend.key.size    = unit(0.4, "cm"),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.margin        = margin(t = 4, r = 10, b = 4, l = 4)
+    )
+}
+
+forest_firth(modelo_firth24, "Forest plot Firth - 24h")
+```
+
+```{r, fig.width=4.2, fig.height=4.2}
+forest_firth(modelo_firth150, "Forest plot Firth - 150h")
+```
+
+
+
+# Matriz de correlación de variables
+
+Antes del FAMD exploramos las correlaciones entre variables. Como tenemos variables mixtas (numéricas y categóricas), convertimos los factores a numérico para obtener una aproximación exploratoria con correlaciones de Pearson.
+
+```{r, fig.width=5.0, fig.height=4.5}
+# Matriz de correlación - 150h
+df_150_num <- df_150 %>%
+  select(-Y) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+cor_150 <- cor(df_150_num, method= "spearman", use = "pairwise.complete.obs")
+
+corrplot(cor_150, method = "color", type = "upper",
+         tl.cex = 0.7, cl.cex = 0.7, tl.col = "black",
+         title = "Matriz de correlaciones — 150h",
+         cex.main = 1.0,
+         mar = c(0, 0, 4, 0))
+```
+
+```{r, fig.width=5.0, fig.height=4.5}
+# Matriz de correlación - 24h
+df_24_num <- df_24 %>%
+  select(-Y) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+cor_24 <- cor(df_24_num, method = "spearman", use = "pairwise.complete.obs")
+
+corrplot(cor_24, method = "color", type = "upper",
+         tl.cex = 0.7, cl.cex = 0.7, tl.col = "black",
+         title = "Matriz de correlaciones — 24h",
+         cex.main = 1.0,
+         mar = c(0, 0, 4, 0))
+```
+
+La matriz de correlación se calculó utilizando el coeficiente de correlación de Spearman, previa conversión de las variables categóricas a valores numéricos ordinales mediante as.numeric(). El coeficiente de Spearman se eligió frente a Pearson por ser más robusto ante la ausencia de normalidad y más adecuado para variables discretas y ordinales.
+
+No obstante, es importante tener en cuenta que la conversión de variables categóricas nominales — como raza, etnia, grupo de estudio o las variables de mutación a valores numéricos mediante as.numeric() asigna números enteros a cada categoría en orden alfabético, lo cual implica asumir una relación ordinal y equidistante entre categorías que en realidad no existe. Por tanto, las correlaciones que involucren estas variables deben interpretarse con cautela y considerarse únicamente como una aproximación exploratoria. Para un análisis más riguroso de las asociaciones entre variables nominales se debería emplear la V de Cramér, mientras que para la relación entre variables numéricas y nominales lo apropiado sería la correlación biserial puntual.
+
+
+
+# Análisis factorial multivariante
+
+Como ya hemos realizado el glm (aunque esos resultados no hay quien los entienda), procedemos a realizar el FAMD sobre los mismos datos. Realizaremos este análisis sobre los datos de 24 y 150 horas de manera separada, y luego compararemos si los resultados obtenidos se asemejan en ambos, lo que nos indicaría que el biomarcador es estable.
+
+## Preprocesado de los datos
+
+Lo primero que debemos hacer es determinar que la variable "y" sea la variable ilustrativa.
+
+```{r}
+y_index_24  <- ncol(df_24)
+y_index_150 <- ncol(df_150)
+```
+
+Antes de imputar, vamos a darle a los valores faltantes de los pacientes pertenecientes a la clase Control sano un valor de 0.
+
+```{r}
+imputar_famd_con_HC_cero <- function(df, ncp = 2,
+                                     grupo_col = "grupo de estudio",
+                                     grupo_control = "Control sano",
+                                     excluir_cols = c("Y", "grupo de estudio")) {
+  
+  df_temp <- df
+  
+  # Si ya no quedan valores faltantes, no hace falta imputar
+  if (sum(is.na(df_temp)) == 0) {
+    return(df_temp)
+  }
+  
+  imputeFAMD(df_temp, ncp = ncp)$complete
+}
+```
+
+
+
+## FAMD - SAA 24 horas
+
+```{r}
+# 1. Identificamos el índice de la variable suplementaria 'Y'
+y_index_24 <- which(names(df_24) == "Y")
+
+# 2. Imputación:
+# - En Control sano, los NA numéricos se sustituyen por 0
+# - En el resto de grupos, los NA se imputan con imputeFAMD()
+df_24_imputado <- imputar_famd_con_HC_cero(df_24, ncp = 2)
+
+# 3. Ejecutamos el FAMD sobre los datos sin nulos
+res.famd24 <- FAMD(
+  df_24_imputado,
+  ncp = 10,
+  sup.var = y_index_24,
+  graph = FALSE
+)
+```
+
+Una vez hecho el análisis, vamos a comprobar la varianza explicada en cada una de las dimensiones generadas:
+
+```{r}
+eig.val24 <- get_eigenvalue(res.famd24)
+head(eig.val24)
+
+fviz_screeplot(res.famd24, addlabels = TRUE, ylim = c(0, 50)) +
+  theme(axis.text = element_text(size = 9), axis.title = element_text(size = 11), plot.title = element_text(size = 13))
+```
+
+Como vemos, la varianza cae suavemente y de forma casi uniforme desde el 12.5% hasta el 6%, donde se observa que la disminución en la varianza explicada en las siguientes componentes se reduce de manera notable, observandose un codo que nos permite quedarnos con las 3 primeras componentes principales.
+
+```{r}
+var24 <- get_famd_var(res.famd24)
+var24
+
+head(var24$coord)
+head(var24$cos2)
+head(var24$contrib)
+
+fviz_famd_var(res.famd24, repel = TRUE)
+```
+
+```{r, fig.width=4.2, fig.height=2.8}
+plot_contrib_es(res.famd24, axes = 1, titulo = "Contribución de variables a la Dimensión 1 - 24h")
+plot_contrib_es(res.famd24, axes = 2, titulo = "Contribución de variables a la Dimensión 2 - 24h")
+plot_contrib_es(res.famd24, axes = 3, titulo = "Contribución de variables a la Dimensión 3 - 24h")
+```
+
+### Gráfico de variables cualitativas
+
+```{r}
+# Categorías cualitativas coloreadas por variable con leyenda - 24h
+plot_quali_by_var(res.famd24, titulo = "Categorías variables cualitativas - 24h")
+```
+
+### Biplot
+
+```{r,  fig.width=6.0, fig.height=3.8}
+# Biplot FAMD - 24h
+# Asegurar que Y existe si estás ejecutando chunks sueltos
+if (!"Y" %in% names(df_24) && "estado SAA" %in% names(df_24)) {
+  df_24$Y <- df_24$`estado SAA`
+  df_24$`estado SAA` <- NULL
+}
+
+df_24$Y <- factor(df_24$Y, levels = c("Negativo", "Positivo"))
+
+ind_coords_24 <- as.data.frame(get_famd_ind(res.famd24)$coord[, 1:2])
+colnames(ind_coords_24) <- c("Dim1", "Dim2")
+
+# Usar Y desde el objeto FAMD si está disponible; si no, desde df_24
+if ("Y" %in% names(res.famd24$call$X)) {
+  ind_coords_24$SAA <- res.famd24$call$X[["Y"]]
+} else {
+  ind_coords_24$SAA <- df_24$Y
+}
+
+ind_coords_24$SAA <- factor(ind_coords_24$SAA, levels = c("Negativo", "Positivo"))
+
+quanti_coords_24 <- as.data.frame(res.famd24$quanti.var$coord[, 1:2])
+colnames(quanti_coords_24) <- c("Dim1", "Dim2")
+quanti_coords_24$variable <- rownames(quanti_coords_24)
+
+scale_factor_24 <- max(abs(ind_coords_24[, 1:2]), na.rm = TRUE) * 0.8
+quanti_coords_24[, 1:2] <- quanti_coords_24[, 1:2] * scale_factor_24
+
+quali_coords_24 <- obtener_quali_coords_famd(res.famd24)
+
+eig_24 <- get_eigenvalue(res.famd24)
+
+ggplot() +
+  geom_point(
+    data = ind_coords_24,
+    aes(x = Dim1, y = Dim2, color = SAA),
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  scale_color_manual(
+    values = c("Negativo" = "#FC4E07", "Positivo" = "#00AFBB"),
+    name = "Estado SAA",
+    drop = FALSE
+  ) +
+  geom_segment(
+    data = quanti_coords_24,
+    aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "#1F3864",
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = quanti_coords_24,
+    aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+    color = "#1F3864",
+    size = 3,
+    fontface = "bold"
+  ) +
+  geom_point(
+    data = quali_coords_24,
+    aes(x = Dim1, y = Dim2),
+    shape = 17,
+    size = 1.5,
+    color = "#C00000"
+  ) +
+  geom_text_repel(
+    data = quali_coords_24,
+    aes(x = Dim1, y = Dim2, label = categoria),
+    color = "#C00000",
+    size = 3,
+    max.overlaps = 15
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(
+    title = "Biplot FAMD - 24h",
+    x = paste0("Dim1 (", round(eig_24[1, 2], 1), "%)"),
+    y = paste0("Dim2 (", round(eig_24[2, 2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+
+### Gráfico de individuos
+
+```{r,  fig.width=7.0, fig.height=2.8}
+ind24 <- get_famd_ind(res.famd24)
+ind24
+
+p_cos2_24 <- fviz_famd_ind(res.famd24, labelsize = 6,
+              col.ind = "cos2",
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom  = "point",
+              repel = TRUE)
+p_cos2_24$layers[[1]] <- NULL
+p_cos2_24
+
+p_saa_24 <- fviz_famd_ind(res.famd24, labelsize = 6,
+              habillage    = "Y",
+              palette      = c("#FC4E07", "#00AFBB"),
+              addEllipses  = TRUE,
+              ellipse.type = "confidence",
+              geom         = "point",
+              repel        = TRUE)
+p_saa_24$layers[[1]] <- NULL
+p_saa_24
+
+add_group_labels <- function(p, res.famd, var) {
+  # Labels replaced by legend — return plot unchanged
+  p
+}
+
+p1 <- fviz_famd_ind(res.famd24, labelsize = 6,
+        habillage = "mutación EP",
+        palette = c("#E63946", "#2196F3"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("Mut. EP — 24h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p1$layers[[1]] <- NULL
+p1 <- add_group_labels(p1, res.famd24, "mutación EP")
+
+p2 <- fviz_famd_ind(res.famd24, labelsize = 6,
+        habillage = "grupo de estudio",
+        palette = c("#E63946", "#FF9800", "#4CAF50", "#2196F3", "#9C27B0"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("Grupo estudio — 24h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p2$layers[[1]] <- NULL
+p2 <- add_group_labels(p2, res.famd24, "grupo de estudio")
+
+p3 <- fviz_famd_ind(res.famd24, labelsize = 6,
+        habillage = "Y",
+        palette = c("#FC4E07", "#00AFBB"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("SAA status — 24h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p3$layers[[1]] <- NULL
+p3 <- add_group_labels(p3, res.famd24, "Y")
+
+
+
+
+## FAMD - SAA 150 HORAS
+
+```{r}
+# Imputación de valores missing en df_150 (igual que se hace en df_24)
+y_index_150 <- which(names(df_150) == "Y")
+
+df_150_imputado <- imputar_famd_con_HC_cero(df_150, ncp = 2)
+
+res.famd150 <- FAMD(
+  df_150_imputado,
+  ncp = 10,
+  sup.var = y_index_150,
+  graph = FALSE
+)
+```
+
+```{r}
+eig.val150 <- get_eigenvalue(res.famd150)
+head(eig.val150)
+
+fviz_screeplot(res.famd150, addlabels = TRUE, ylim = c(0, 50)) +
+  theme(axis.text = element_text(size = 9), axis.title = element_text(size = 11), plot.title = element_text(size = 13))
+```
+
+```{r}
+var150 <- get_famd_var(res.famd150)
+head(var150$coord)
+head(var150$cos2)
+head(var150$contrib)
+fviz_famd_var(res.famd150, repel = TRUE)
+```
+
+```{r, fig.width=4.2, fig.height=2.8}
+plot_contrib_es(res.famd150, axes = 1, titulo = "Contribución de variables a la Dimensión 1 - 150h")
+plot_contrib_es(res.famd150, axes = 2, titulo = "Contribución de variables a la Dimensión 2 - 150h")
+plot_contrib_es(res.famd150, axes = 3, titulo = "Contribución de variables a la Dimensión 3 - 150h")
+```
+Al comparar el primer gráfico de esta FAMD con el de 150 horas, vemos que el principal cambio que se aprecia es que la variable raza, aquí no contribuye prácticamente nada en ninguna de las dos primeras dimensiones, mientras que en 24 horas la influencia con
+
+
+```{r}
+# Categorías cualitativas coloreadas por variable con leyenda - 150h
+plot_quali_by_var(res.famd150, titulo = "Categorías variables cualitativas - 150h")
+```
+
+```{r, fig.width=6.0, fig.height=3.8}
+# Biplot FAMD - 150h
+# Asegurar que Y existe si estás ejecutando chunks sueltos
+if (!"Y" %in% names(df_150) && "estado SAA" %in% names(df_150)) {
+  df_150$Y <- df_150$`estado SAA`
+  df_150$`estado SAA` <- NULL
+}
+
+df_150$Y <- factor(df_150$Y, levels = c("Negativo", "Positivo"))
+
+ind_coords_150 <- as.data.frame(get_famd_ind(res.famd150)$coord[, 1:2])
+colnames(ind_coords_150) <- c("Dim1", "Dim2")
+
+# Usar Y desde el objeto FAMD si está disponible; si no, desde df_150
+if ("Y" %in% names(res.famd150$call$X)) {
+  ind_coords_150$SAA <- res.famd150$call$X[["Y"]]
+} else {
+  ind_coords_150$SAA <- df_150$Y
+}
+
+ind_coords_150$SAA <- factor(ind_coords_150$SAA, levels = c("Negativo", "Positivo"))
+
+quanti_coords_150 <- as.data.frame(res.famd150$quanti.var$coord[, 1:2])
+colnames(quanti_coords_150) <- c("Dim1", "Dim2")
+quanti_coords_150$variable <- rownames(quanti_coords_150)
+
+scale_factor_150 <- max(abs(ind_coords_150[, 1:2]), na.rm = TRUE) * 0.8
+quanti_coords_150[, 1:2] <- quanti_coords_150[, 1:2] * scale_factor_150
+
+quali_coords_150 <- obtener_quali_coords_famd(res.famd150)
+
+eig_150 <- get_eigenvalue(res.famd150)
+
+ggplot() +
+  geom_point(
+    data = ind_coords_150,
+    aes(x = Dim1, y = Dim2, color = SAA),
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  scale_color_manual(
+    values = c("Negativo" = "#FC4E07", "Positivo" = "#00AFBB"),
+    name = "Estado SAA",
+    drop = FALSE
+  ) +
+  geom_segment(
+    data = quanti_coords_150,
+    aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "#1F3864",
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = quanti_coords_150,
+    aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+    color = "#1F3864",
+    size = 3,
+    fontface = "bold"
+  ) +
+  geom_point(
+    data = quali_coords_150,
+    aes(x = Dim1, y = Dim2),
+    shape = 17,
+    size = 1.5,
+    color = "#C00000"
+  ) +
+  geom_text_repel(
+    data = quali_coords_150,
+    aes(x = Dim1, y = Dim2, label = categoria),
+    color = "#C00000",
+    size = 3,
+    max.overlaps = 15
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(
+    title = "Biplot FAMD - 150h",
+    x = paste0("Dim1 (", round(eig_150[1, 2], 1), "%)"),
+    y = paste0("Dim2 (", round(eig_150[2, 2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+
+```{r, fig.width=7.0, fig.height=2.8}
+
+ind150 <- get_famd_ind(res.famd150)
+ind150
+
+p_cos2_150 <- fviz_famd_ind(res.famd150, labelsize = 6,
+              col.ind = "cos2",
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom  = "point",
+              repel = TRUE)
+p_cos2_150$layers[[1]] <- NULL
+p_cos2_150
+
+p_saa_150 <- fviz_famd_ind(res.famd150, labelsize = 6,
+              habillage    = "Y",
+              palette      = c("#FC4E07", "#00AFBB"),
+              addEllipses  = TRUE,
+              ellipse.type = "confidence",
+              geom         = "point",
+              repel        = TRUE)
+p_saa_150$layers[[1]] <- NULL
+p_saa_150
+
+ind150 <- get_famd_ind(res.famd150)
+
+# Aplicamos a cada panel y quitamos la leyenda lateral
+p1_150 <- fviz_famd_ind(res.famd150, labelsize = 6,
+        habillage = "mutación EP",
+        palette = c("#E63946", "#2196F3"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("Mut. EP — 150h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p1_150$layers[[1]] <- NULL
+p1_150 <- add_group_labels(p1_150, res.famd150, "mutación EP")
+
+p2_150 <- fviz_famd_ind(res.famd150, labelsize = 6,
+        habillage = "grupo de estudio",
+        palette = c("#E63946", "#FF9800", "#4CAF50", "#2196F3", "#9C27B0", "#00BCD4"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("Grupo estudio — 150h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p2_150$layers[[1]] <- NULL
+p2_150 <- add_group_labels(p2_150, res.famd150, "grupo de estudio")
+
+p3_150 <- fviz_famd_ind(res.famd150, labelsize = 6,
+        habillage = "Y",
+        palette = c("#FC4E07", "#00AFBB"),
+        addEllipses = TRUE, ellipse.type = "confidence",
+        geom = "point", repel = FALSE) +
+        ggtitle("SAA status — 150h") +
+        theme(legend.position = "right",
+              legend.text  = element_text(size = 7),
+              legend.key.size = unit(0.3, "cm"),
+              axis.text  = element_text(size = 8),
+              axis.title = element_text(size = 9),
+              plot.title = element_text(size = 9, face = "bold", hjust = 0.5))
+p3_150$layers[[1]] <- NULL
+p3_150 <- add_group_labels(p3_150, res.famd150, "Y")
+
+```
+
+```{r, fig.width=8.0, fig.height=3.2}
+# Panel enfrentado: Mutación EP conocida — 24h vs 150h
+(p1 | p1_150) +
+  plot_annotation(title = "Mutación EP — 24h vs 150h",
+                  theme = theme(plot.title = element_text(size = 9, face = "bold", hjust = 0.5)))
+```
+
+```{r, fig.width=8.0, fig.height=3.2}
+# Panel enfrentado: Diagnóstico clínico — 24h vs 150h
+(p2 | p2_150) +
+  plot_annotation(title = "Diagnóstico clínico — 24h vs 150h",
+                  theme = theme(plot.title = element_text(size = 9, face = "bold", hjust = 0.5)))
+```
+
+```{r, fig.width=8.0, fig.height=3.2}
+# Panel enfrentado: Estado SAA — 24h vs 150h
+(p3 | p3_150) +
+  plot_annotation(title = "Estado SAA — 24h vs 150h",
+                  theme = theme(plot.title = element_text(size = 9, face = "bold", hjust = 0.5)))
+
+# plots 150h defined above
+
+## Gráficos de FAMD 24 y 150 h juntos
+
+```{r, fig.width=8.0, fig.height=3.0}
+library(patchwork)
+
+# ============================================================
+# CÓMPUTO
+# ============================================================
+
+res.famd24  <- FAMD(df_24_imputado,  ncp = 10, sup.var = y_index_24,  graph = FALSE)
+res.famd150 <- FAMD(df_150_imputado, ncp = 10, sup.var = y_index_150, graph = FALSE)
+
+# ============================================================
+# EIGENVALORES / VARIANZA EXPLICADA
+# ============================================================
+
+eig.val24  <- get_eigenvalue(res.famd24)
+eig.val150 <- get_eigenvalue(res.famd150)
+
+head(eig.val24)
+head(eig.val150)
+
+(fviz_screeplot(res.famd24,  addlabels = TRUE, ylim = c(0, 50)) + ggtitle("Scree plot - 24h")) |
+(fviz_screeplot(res.famd150, addlabels = TRUE, ylim = c(0, 50)) +
+  theme(axis.text = element_text(size = 9), axis.title = element_text(size = 11), plot.title = element_text(size = 13)) + ggtitle("Scree plot - 150h"))
+
+# ============================================================
+# GRÁFICO DE VARIABLES
+# ============================================================
+
+var24  <- get_famd_var(res.famd24)
+var150 <- get_famd_var(res.famd150)
+
+head(var24$coord);   head(var150$coord)
+head(var24$cos2);    head(var150$cos2)
+head(var24$contrib); head(var150$contrib)
+
+(fviz_famd_var(res.famd24,  repel = TRUE) + ggtitle("Variables - 24h")) |
+(fviz_famd_var(res.famd150, repel = TRUE) + ggtitle("Variables - 150h"))
+
+plot_contrib_es(res.famd24,  axes = 1, titulo = "Contribución de variables a la Dimensión 1 - 24h") |
+plot_contrib_es(res.famd150, axes = 1, titulo = "Contribución de variables a la Dimensión 1 - 150h")
+
+plot_contrib_es(res.famd24,  axes = 2, titulo = "Contribución de variables a la Dimensión 2 - 24h") |
+plot_contrib_es(res.famd150, axes = 2, titulo = "Contribución de variables a la Dimensión 2 - 150h")
+
+plot_contrib_es(res.famd24,  axes = 3, titulo = "Contribución de variables a la Dimensión 3 - 24h") |
+plot_contrib_es(res.famd150, axes = 3, titulo = "Contribución de variables a la Dimensión 3 - 150h")
+
+plot_contrib_es(res.famd24,  axes = 4, titulo = "Contribución de variables a la Dimensión 4 - 24h") |
+plot_contrib_es(res.famd150, axes = 4, titulo = "Contribución de variables a la Dimensión 4 - 150h")
+
+# ============================================================
+# GRÁFICO DE VARIABLES CUALITATIVAS
+# Coloreado por variable con leyenda
+# ============================================================
+
+plot_quali_by_var(res.famd24,  titulo = "Categorías variables cualitativas - 24h") |
+plot_quali_by_var(res.famd150, titulo = "Categorías variables cualitativas - 150h")
+
+#BIPLOT
+
+biplot_24 <- ggplot() +
+  geom_point(data = ind_coords_24,
+             aes(x = Dim1, y = Dim2, color = SAA),
+             alpha = 0.4, size = 1.5) +
+  scale_color_manual(values = c("Negative" = "#FC4E07", "Positive" = "#00AFBB"),
+                     name = "SAA status") +
+  geom_segment(data = quanti_coords_24,
+               aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "#1F3864", linewidth = 0.7) +
+  geom_text(data = quanti_coords_24,
+            aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+            color = "#1F3864", size = 3, fontface = "bold") +
+  geom_point(data = quali_coords_24,
+             aes(x = Dim1, y = Dim2),
+             shape = 17, size = 2, color = "#C00000") +
+  geom_text_repel(data = quali_coords_24,
+                  aes(x = Dim1, y = Dim2, label = categoria),
+                  color = "#C00000", size = 3, max.overlaps = 15) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(title = "Biplot FAMD - 24h",
+       x = paste0("Dim1 (", round(eig_24[1, 2], 1), "%)"),
+       y = paste0("Dim2 (", round(eig_24[2, 2], 1), "%)")) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+biplot_150 <- ggplot() +
+  geom_point(data = ind_coords_150,
+             aes(x = Dim1, y = Dim2, color = SAA),
+             alpha = 0.4, size = 1.5) +
+  scale_color_manual(values = c("Negative" = "#FC4E07", "Positive" = "#00AFBB"),
+                     name = "SAA status") +
+  geom_segment(data = quanti_coords_150,
+               aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "#1F3864", linewidth = 0.7) +
+  geom_text(data = quanti_coords_150,
+            aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+            color = "#1F3864", size = 3, fontface = "bold") +
+  geom_point(data = quali_coords_150,
+             aes(x = Dim1, y = Dim2),
+             shape = 17, size = 2, color = "#C00000") +
+  geom_text_repel(data = quali_coords_150,
+                  aes(x = Dim1, y = Dim2, label = categoria),
+                  color = "#C00000", size = 3, max.overlaps = 15) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(title = "Biplot FAMD - 150h",
+       x = paste0("Dim1 (", round(eig_150[1, 2], 1), "%)"),
+       y = paste0("Dim2 (", round(eig_150[2, 2], 1), "%)")) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+biplot_24 | biplot_150
+
+# ============================================================
+# GRÁFICO DE INDIVIDUOS
+# ============================================================
+
+ind24  <- get_famd_ind(res.famd24)
+ind150 <- get_famd_ind(res.famd150)
+
+fviz_famd_ind(res.famd24, labelsize = 6,
+              col.ind = "cos2",
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom = "point", repel = TRUE) + ggtitle("Individuos cos2 - 24h") |
+fviz_famd_ind(res.famd150, labelsize = 6,
+              col.ind = "cos2",
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom = "point", repel = TRUE) + ggtitle("Individuos cos2 - 150h")
+
+fviz_famd_ind(res.famd24, labelsize = 6,
+              habillage = "Y", palette = c("#FC4E07", "#00AFBB"),
+              addEllipses = TRUE, ellipse.type = "confidence",
+              geom = "point", repel = TRUE) + ggtitle("estado SAA - 24h") |
+fviz_famd_ind(res.famd150, labelsize = 6,
+              habillage = "Y", palette = c("#FC4E07", "#00AFBB"),
+              addEllipses = TRUE, ellipse.type = "confidence",
+              geom = "point", repel = TRUE) + ggtitle("estado SAA - 150h")
+```
+
+```{r, fig.width=9.0, fig.height=4.5}
+(p1 | p2 | p3) /
+(p1_150 | p2_150 | p3_150)
+```
+
+## MCA -- Análisis de Correspondencias multiples
+
+```{r}
+ajustar_mca <- function(df, vars_nominales, y = "Y", ncp = 2) {
+  
+  df_mca <- df %>%
+    dplyr::select(all_of(unique(c(vars_nominales, y)))) %>%
+    mutate(across(everything(), as.factor))
+  
+  df_mca <- df_mca[, sapply(df_mca, function(x) dplyr::n_distinct(x, na.rm = TRUE) > 1), drop = FALSE]
+  
+  y_idx <- which(names(df_mca) == y)
+  
+  if (sum(is.na(df_mca[, setdiff(names(df_mca), y), drop = FALSE])) > 0) {
+    imp <- missMDA::imputeMCA(df_mca[, setdiff(names(df_mca), y), drop = FALSE], ncp = ncp)
+    df_mca_comp <- as.data.frame(imp$completeObs)
+    df_mca_comp[[y]] <- df_mca[[y]]
+    df_mca_comp[[y]] <- as.factor(df_mca_comp[[y]])
+  } else {
+    df_mca_comp <- df_mca
+  }
+  
+  y_idx <- which(names(df_mca_comp) == y)
+  res <- FactoMineR::MCA(df_mca_comp, quali.sup = y_idx, graph = FALSE)
+  list(data = df_mca_comp, res = res)
+}
+
+plot_mca_biplot_y <- function(res_mca, df_mca, titulo = "") {
+  
+  # Coordenadas de individuos
+  ind_coords <- as.data.frame(res_mca$ind$coord[, 1:2])
+  colnames(ind_coords) <- c("Dim1", "Dim2")
+  ind_coords$SAA <- df_mca$Y
+  
+  # Coordenadas de categorías de variables
+  var_coords <- as.data.frame(res_mca$var$coord[, 1:2])
+  colnames(var_coords) <- c("Dim1", "Dim2")
+  var_coords$categoria <- rownames(var_coords)
+  
+  # Varianza explicada para los ejes
+  eig <- get_eigenvalue(res_mca)
+  
+  ggplot() +
+    # Individuos como puntos coloreados por SAA
+    geom_point(data = ind_coords,
+               aes(x = Dim1, y = Dim2, color = SAA),
+               alpha = 0.4, size = 3) +
+    scale_color_manual(values = c("Negativo" = "#FC4E07", "Positivo" = "#00AFBB"),
+                       name = "Estado SAA") +
+    # Categorías como triángulos con etiqueta
+    geom_point(data = var_coords,
+               aes(x = Dim1, y = Dim2),
+               shape = 17, size = 3, color = "#C00000") +
+    geom_text_repel(data = var_coords,
+                    aes(x = Dim1, y = Dim2, label = categoria),
+                    color = "#C00000", size = 6,
+                    max.overlaps = 20,
+                    fontface = "bold") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    labs(
+      title = titulo,
+      x = paste0("Dim1 (", round(eig[1, 2], 1), "%)"),
+      y = paste0("Dim2 (", round(eig[2, 2], 1), "%)")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text    = element_text(size = 9),
+      axis.title   = element_text(size = 11),
+      plot.title   = element_text(size = 13, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 10),
+      legend.text  = element_text(size = 9)
+    )
+}
+```
+
+
+
+```{r,  fig.width=5.5, fig.height=3.5}
+
+# ── Ajuste del MCA con Y como variable suplementaria ──
+mca24  <- ajustar_mca(df_24_imputado,  vars_nominales, y = "Y", ncp = 5)
+mca150 <- ajustar_mca(df_150_imputado, vars_nominales, y = "Y", ncp = 5)
+
+# ── Print del objeto MCA ──
+print(mca24$res)
+print(mca150$res)
+
+# ── Eigenvalores y varianza explicada ──
+eig_mca24  <- get_eigenvalue(mca24$res)
+eig_mca150 <- get_eigenvalue(mca150$res)
+
+head(eig_mca24)
+head(eig_mca150)
+
+# ── Scree plot ──
+(fviz_screeplot(mca24$res,  addlabels = TRUE) + ggtitle("Scree plot MCA - 24h")) |
+(fviz_screeplot(mca150$res, addlabels = TRUE) + ggtitle("Scree plot MCA - 150h"))
+
+# ── Biplot inicial: individuos + categorías superpuestos ──
+fviz_mca_biplot(mca24$res,
+                repel = TRUE,
+                alpha.ind = 0.1,
+                alpha.var = 1,
+                ggtheme = theme_minimal()) +
+  ggtitle("Biplot MCA - 24h") |
+fviz_mca_biplot(mca150$res,
+                repel = TRUE,
+                alpha.ind = 0.1,
+                alpha.var = 1,
+                ggtheme = theme_minimal()) +
+  ggtitle("Biplot MCA - 150h")
+
+# ── Descripción de las dimensiones ──
+res.desc24  <- dimdesc(mca24$res,  axes = c(1, 2))
+res.desc150 <- dimdesc(mca150$res, axes = c(1, 2))
+
+# Dimensión 1
+res.desc24[[1]]
+res.desc150[[1]]
+
+# Dimensión 2
+res.desc24[[2]]
+res.desc150[[2]]
+
+# ── Variables: coordenadas, cos2 y contribuciones ──
+variables24  <- get_mca_var(mca24$res)
+variables150 <- get_mca_var(mca150$res)
+
+head(variables24$coord)
+head(variables24$cos2)
+head(variables24$contrib)
+
+# ── Correlaciones entre variables y dimensiones ──
+fviz_mca_var(mca24$res,
+             choice = "mca.cor",
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Correlación variables-dimensiones - 24h") |
+fviz_mca_var(mca150$res,
+             choice = "mca.cor",
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Correlación variables-dimensiones - 150h")
+
+# ── Categorías coloreadas por cos2 ──
+fviz_mca_var(mca24$res,
+             col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Categorías MCA - cos2 (24h)") |
+fviz_mca_var(mca150$res,
+             col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Categorías MCA - cos2 (150h)")
+
+# ── Calidad de representación de categorías (barplot cos2) ──
+fviz_cos2(mca24$res,  choice = "var", axes = 1:2) +
+  ggtitle("Calidad representación categorías - 24h") |
+fviz_cos2(mca150$res, choice = "var", axes = 1:2) +
+  ggtitle("Calidad representación categorías - 150h")
+
+# ── Categorías coloreadas por contribución ──
+fviz_mca_var(mca24$res,
+             col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Categorías MCA - contrib (24h)") |
+fviz_mca_var(mca150$res,
+             col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Categorías MCA - contrib (150h)")
+
+# ── Contribución de categorías a cada dimensión ──
+```
+
+```{r, fig.width=4.2, fig.height=2.8}
+plot_contrib_es(
+  mca24$res,
+  axes = 1,
+  top = 6,
+  titulo = "Contribución de categorías a la Dimensión 1 - MCA 24h"
+) |
+plot_contrib_es(
+  mca150$res,
+  axes = 1,
+  top = 6,
+  titulo = "Contribución de categorías a la Dimensión 1 - MCA 150h"
+)
+
+plot_contrib_es(
+  mca24$res,
+  axes = 2,
+  top = 6,
+  titulo = "Contribución de categorías a la Dimensión 2 - MCA 24h"
+) |
+plot_contrib_es(
+  mca150$res,
+  axes = 2,
+  top = 6,
+  titulo = "Contribución de categorías a la Dimensión 2 - MCA 150h"
+)
+```
+
+```{r,  fig.width=5.5, fig.height=3.5}
+fviz_contrib(mca24$res,  choice = "var", axes = 1:2, top = 20) +
+  ggtitle("Contrib total Dim1+2 - 24h") |
+fviz_contrib(mca150$res, choice = "var", axes = 1:2, top = 20) +
+  ggtitle("Contrib total Dim1+2 - 150h")
+
+# ── Individuos: coordenadas, cos2 y contribuciones ──
+indiv24  <- get_mca_ind(mca24$res)
+indiv150 <- get_mca_ind(mca150$res)
+
+head(indiv24$coord,  3)
+head(indiv24$cos2,   3)
+head(indiv24$contrib,3)
+
+# ── Individuos coloreados por cos2 ──
+fviz_mca_ind(mca24$res,
+             col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos MCA - cos2 (24h)") |
+fviz_mca_ind(mca150$res,
+             col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos MCA - cos2 (150h)")
+
+# ── Individuos coloreados por contribución ──
+fviz_mca_ind(mca24$res,
+             col.ind = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos MCA - contrib (24h)") |
+fviz_mca_ind(mca150$res,
+             col.ind = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos MCA - contrib (150h)")
+
+# ── Agrupamiento por SAA status (Y) ──
+fviz_mca_ind(mca24$res,
+             label = "none",
+             habillage = "Y",
+             palette = c("#FC4E07", "#00AFBB"),
+             addEllipses = TRUE,
+             ellipse.type = "confidence",
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos agrupados por SAA status - 24h") |
+fviz_mca_ind(mca150$res,
+             label = "none",
+             habillage = "Y",
+             palette = c("#FC4E07", "#00AFBB"),
+             addEllipses = TRUE,
+             ellipse.type = "confidence",
+             ggtheme = theme_minimal()) +
+  ggtitle("Individuos agrupados por SAA status - 150h")
+
+# Individuos agrupados por grupo de estudio
+fviz_mca_ind(mca24$res,
+             label = "none",
+             habillage = "grupo de estudio",
+             addEllipses = TRUE,
+             ellipse.type = "confidence",
+             alpha.ind = 0.5,
+             ggtheme = theme_minimal()) +
+  ggtitle("MCA - grupo de estudio 24h") |
+fviz_mca_ind(mca150$res,
+             label = "none",
+             habillage = "grupo de estudio",
+             addEllipses = TRUE,
+             ellipse.type = "confidence",
+             alpha.ind = 0.5,
+             ggtheme = theme_minimal()) +
+  ggtitle("MCA - grupo de estudio 150h")
+
+# Individuos agrupados por SAA status
+coords24_df <- as.data.frame(mca24$res$ind$coord[, 1:2])
+colnames(coords24_df) <- c("Dim1", "Dim2")
+coords24_df$SAA <- mca24$data$Y
+
+bubble24 <- coords24_df %>%
+  group_by(Dim1, Dim2, SAA) %>%
+  summarise(n = n(), .groups = "drop")
+
+p_bubble24 <- ggplot(bubble24, aes(x = Dim1, y = Dim2, size = n, color = SAA)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Negative" = "#FC4E07", "Positive" = "#00AFBB")) +
+  scale_size_continuous(range = c(2, 15), name = "N individuos") +
+  labs(title = "MCA - SAA status 24h (tamaño = N individuos)",
+       x = paste0("Dim1 (", round(get_eigenvalue(mca24$res)[1, 2], 1), "%)"),
+       y = paste0("Dim2 (", round(get_eigenvalue(mca24$res)[2, 2], 1), "%)")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  theme_minimal()
+
+coords150_df <- as.data.frame(mca150$res$ind$coord[, 1:2])
+colnames(coords150_df) <- c("Dim1", "Dim2")
+coords150_df$SAA <- mca150$data$Y
+
+bubble150 <- coords150_df %>%
+  group_by(Dim1, Dim2, SAA) %>%
+  summarise(n = n(), .groups = "drop")
+
+p_bubble150 <- ggplot(bubble150, aes(x = Dim1, y = Dim2, size = n, color = SAA)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Negative" = "#FC4E07", "Positive" = "#00AFBB")) +
+  scale_size_continuous(range = c(2, 15), name = "N individuos") +
+  labs(title = "MCA - SAA status 150h (tamaño = N individuos)",
+       x = paste0("Dim1 (", round(get_eigenvalue(mca150$res)[1, 2], 1), "%)"),
+       y = paste0("Dim2 (", round(get_eigenvalue(mca150$res)[2, 2], 1), "%)")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  theme_minimal()
+
+p_bubble24 | p_bubble150
+```
+
+
+
+
+# Material suplementario — Control positivo de los análisis
+
+Repetimos los análisis FAMD filtrando únicamente los grupos **EP** y **Control sano**.
+Al reducir la muestra a dos grupos extremos (casi todos SAA+ en EP, casi todos SAA− en controles),
+esperamos que `grupo de estudio` explique una proporción mucho mayor de la varianza total,
+confirmando que el biomarcador SAA está alineado con el diagnóstico clínico.
+
+```{r}
+## Material suplementario: control positivo (solo EP vs Control sano)
+
+df_24_cp <- df_24 %>%
+  filter(
+    (`grupo de estudio` == "EP" & `mutación EP` == "No") |
+    (`grupo de estudio` == "Control sano")
+  ) %>%
+  select(-`mutación GBA`, 
+         -`mutación LRRK2`,
+         -`mutación SNCA`,
+         -`mutación APOE_E4`,
+         -`mutación EP`,
+         -etnia) %>%
+  droplevels()
+
+df_150_cp <- df_150 %>%
+  filter(
+    (`grupo de estudio` == "EP" & `mutación EP` == "No") |
+    (`grupo de estudio` == "Control sano")
+  ) %>%
+  select(-`mutación GBA`,
+         -`mutación LRRK2`,
+         -`mutación SNCA`,
+         -`mutación APOE_E4`,
+         -`mutación EP`,
+         -etnia) %>%
+  droplevels()
+
+
+# Convertir a factor
+df_24_cp <- df_24_cp %>%
+  mutate(across(where(is.character), as.factor))
+df_150_cp <- df_150_cp %>%
+  mutate(across(where(is.character), as.factor))
+
+# Eliminar columnas con un solo valor único
+df_24_cp <- df_24_cp[, sapply(df_24_cp, function(x) n_distinct(x, na.rm = TRUE) > 1)]
+df_150_cp <- df_150_cp[, sapply(df_150_cp, function(x) n_distinct(x, na.rm = TRUE) > 1)]
+
+# Imputación
+df_24_cp_imp  <- imputar_famd_con_HC_cero(df_24_cp,  ncp = 2)
+df_150_cp_imp <- imputar_famd_con_HC_cero(df_150_cp, ncp = 2)
+
+# Calcular índices AQUÍ, después de todas las transformaciones
+y_index_24_cp  <- which(names(df_24_cp_imp) == "Y")
+y_index_150_cp <- which(names(df_150_cp_imp) == "Y")
+
+res.famd24_cp <- FAMD(
+  df_24_cp_imp,
+  ncp = 10,
+  sup.var = which(names(df_24_cp_imp) == "Y"),
+  graph = FALSE
+)
+
+res.famd150_cp <- FAMD(
+  df_150_cp_imp,
+  ncp = 10,
+  sup.var = which(names(df_150_cp_imp) == "Y"),
+  graph = FALSE
+)
+```
+
+#Análisis de regresión penalizada
+```{r}
+# Regresión de Firth - control positivo 24h
+modelo_firth24_cp <- logistf(Y ~ ., data = df_24_cp_imp)
+summary(modelo_firth24_cp)
+```
+
+```{r, fig.width=4.2, fig.height=3.8}
+
+# Regresión de Firth - control positivo 150h
+modelo_firth150_cp <- logistf(Y ~ ., data = df_150_cp_imp)
+summary(modelo_firth150_cp)
+
+# Forest plot CP
+forest_firth(modelo_firth24_cp,  "Forest plot Firth - CP 24h")
+```
+
+```{r, fig.width=4.2, fig.height=3.8}
+forest_firth(modelo_firth150_cp, "Forest plot Firth - CP 150h")
+```
+En los modelos de regresión penalizada de 24 y 150 horas para el control positivo solo muestra significancia estadística muy elevada la clase EP de grupo de estudio aumentando ampliamente las probabilidades de SAA positivo.
+
+#Matriz de correlacion - control positivo
+
+```{r, fig.width=5.0, fig.height=4.5}
+# Matriz de correlación - control positivo 24h
+df_24_cp_num <- df_24_cp_imp %>%
+  select(-Y) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+cor_24_cp <- cor(df_24_cp_num, method = "spearman", use = "pairwise.complete.obs")
+
+corrplot(cor_24_cp, method = "color", type = "upper",
+         tl.cex = 2.0, cl.cex = 1.8, tl.col = "black",
+         title = "Matriz de correlaciones — CP 24h",
+         cex.main = 2.5,
+         mar = c(0, 0, 4, 0))
+
+# Matriz de correlación - control positivo 150h
+df_150_cp_num <- df_150_cp_imp %>%
+  select(-Y) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+cor_150_cp <- cor(df_150_cp_num, method = "spearman", use = "pairwise.complete.obs")
+
+corrplot(cor_150_cp, method = "color", type = "upper",
+         tl.cex = 2.0, cl.cex = 1.8, tl.col = "black",
+         title = "Matriz de correlaciones — CP 150h",
+         cex.main = 2.5,
+         mar = c(0, 0, 4, 0))
+```
+
+
+
+
+## Screeplots control positivo
+
+```{r, fig.width=5.5, fig.height=3.0}
+eig.val24_cp <- get_eigenvalue(res.famd24_cp)
+eig.val150_cp <- get_eigenvalue(res.famd150_cp)
+
+(fviz_screeplot(res.famd24_cp, addlabels = TRUE, ylim = c(0, 50)) +
+  ggtitle("Control positivo - 24h")) |
+(fviz_screeplot(res.famd150_cp, addlabels = TRUE, ylim = c(0, 50)) +
+  ggtitle("Control positivo - 150h"))
+```
+
+
+## Contribucion de las variables a la varianza en el control positivo
+
+```{r, fig.width=5.5, fig.height=3.5}
+plot_contrib <- function(res, dim, titulo) {
+  contrib <- get_famd_var(res)$contrib
+  
+  df <- as.data.frame(contrib)
+  df$variable <- rownames(df)
+  
+  df <- df %>%
+    arrange(desc(.data[[dim]])) %>%
+    slice(1:10)
+  
+  ggplot(df, aes(x = reorder(variable, - .data[[dim]]),
+                 y = .data[[dim]])) +
+    geom_col(fill = "#4C78A8") +
+    geom_text(aes(label = paste0(round(.data[[dim]], 1), "%")),
+              vjust = -0.4, size = 6) +
+    labs(
+      title = titulo,
+      x = "Variables",
+      y = "% contribución"
+    ) +
+    theme_minimal() +
+    theme(
+      text = element_text(size = 9),
+      axis.text.x = element_text(size = 9, angle = 60, hjust = 1, vjust = 1)
+    ) +
+    ylim(0, max(df[[dim]]) * 1.2)
+}
+```
+
+
+```{r, fig.width=4.2, fig.height=2.8}
+plot_contrib_es(
+  res.famd24_cp,
+  axes = 1,
+  top = 6,
+  titulo = "Contribución de variables a la Dimensión 1 - Control positivo 24h"
+) |
+plot_contrib_es(
+  res.famd150_cp,
+  axes = 1,
+  top = 6,
+  titulo = "Contribución de variables a la Dimensión 1 - Control positivo 150h"
+)
+
+plot_contrib_es(
+  res.famd24_cp,
+  axes = 2,
+  top = 6,
+  titulo = "Contribución de variables a la Dimensión 2 - Control positivo 24h"
+) |
+plot_contrib_es(
+  res.famd150_cp,
+  axes = 2,
+  top = 6,
+  titulo = "Contribución de variables a la Dimensión 2 - Control positivo 150h"
+)
+```
+
+
+```{r, fig.width=5.5, fig.height=3.5}
+
+plot_quali_by_var(res.famd24_cp,  titulo = "Categorías variables cualitativas - control positivo 24h") |
+plot_quali_by_var(res.famd150_cp, titulo = "Categorías variables cualitativas - control positivo 150h")
+```
+
+
+```{r, fig.width=5.5, fig.height=3.5}
+
+# INDIVIDUOS cos2 - CONTROL POSITIVO
+ind24_cp  <- get_famd_ind(res.famd24_cp)
+ind150_cp <- get_famd_ind(res.famd150_cp)
+
+p_cos2_24_cp <- fviz_famd_ind(
+  res.famd24_cp,
+  col.ind = "cos2",
+  gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+  geom = "point",
+  repel = TRUE
+) + ggtitle("Individuos cos2 - CP 24h")
+p_cos2_24_cp$layers[[1]] <- NULL
+
+p_cos2_150_cp <- fviz_famd_ind(
+  res.famd150_cp,
+  col.ind = "cos2",
+  gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+  geom = "point",
+  repel = TRUE
+) + ggtitle("Individuos cos2 - CP 150h")
+p_cos2_150_cp$layers[[1]] <- NULL
+
+p_cos2_24_cp | p_cos2_150_cp
+
+# SAA STATUS - CONTROL POSITIVO
+p_saa_24_cp <- fviz_famd_ind(
+  res.famd24_cp,
+  habillage = "Y",
+  palette = c("#FC4E07", "#00AFBB"),
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  geom = "point",
+  repel = TRUE
+) + ggtitle("estado SAA - CP 24h")
+p_saa_24_cp$layers[[1]] <- NULL
+
+p_saa_150_cp <- fviz_famd_ind(
+  res.famd150_cp,
+  habillage = "Y",
+  palette = c("#FC4E07", "#00AFBB"),
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  geom = "point",
+  repel = TRUE
+) + ggtitle("estado SAA - CP 150h")
+p_saa_150_cp$layers[[1]] <- NULL
+
+p_saa_24_cp | p_saa_150_cp
+```
+
+
+```{r, fig.width=5.5, fig.height=3.5}
+# ── Coordenadas individuos CP ──
+ind_coords_24_cp <- as.data.frame(get_famd_ind(res.famd24_cp)$coord[, 1:2])
+colnames(ind_coords_24_cp) <- c("Dim1", "Dim2")
+ind_coords_24_cp$SAA <- res.famd24_cp$call$X[["Y"]]
+
+ind_coords_150_cp <- as.data.frame(get_famd_ind(res.famd150_cp)$coord[, 1:2])
+colnames(ind_coords_150_cp) <- c("Dim1", "Dim2")
+ind_coords_150_cp$SAA <- res.famd150_cp$call$X[["Y"]]
+
+# ── Coordenadas variables cuantitativas CP ──
+quanti_coords_24_cp <- as.data.frame(res.famd24_cp$quanti.var$coord[, 1:2])
+colnames(quanti_coords_24_cp) <- c("Dim1", "Dim2")
+quanti_coords_24_cp$variable <- rownames(quanti_coords_24_cp)
+scale_factor_24_cp <- max(abs(ind_coords_24_cp[, 1:2])) * 0.8
+quanti_coords_24_cp[, 1:2] <- quanti_coords_24_cp[, 1:2] * scale_factor_24_cp
+
+quanti_coords_150_cp <- as.data.frame(res.famd150_cp$quanti.var$coord[, 1:2])
+colnames(quanti_coords_150_cp) <- c("Dim1", "Dim2")
+quanti_coords_150_cp$variable <- rownames(quanti_coords_150_cp)
+scale_factor_150_cp <- max(abs(ind_coords_150_cp[, 1:2])) * 0.8
+quanti_coords_150_cp[, 1:2] <- quanti_coords_150_cp[, 1:2] * scale_factor_150_cp
+
+# ── Coordenadas variables cualitativas CP con etiquetas variable: categoría ──
+quali_coords_24_cp <- obtener_quali_coords_famd(res.famd24_cp)
+
+quali_coords_150_cp <- obtener_quali_coords_famd(res.famd150_cp)
+
+eig_24_cp  <- get_eigenvalue(res.famd24_cp)
+eig_150_cp <- get_eigenvalue(res.famd150_cp)
+
+# ── Biplots CP ──
+# Biplot FAMD - Control positivo 24h
+
+# Asegurar que Y existe si estás ejecutando chunks sueltos
+if (!"Y" %in% names(df_24_cp) && "estado SAA" %in% names(df_24_cp)) {
+  df_24_cp$Y <- df_24_cp$`estado SAA`
+  df_24_cp$`estado SAA` <- NULL
+}
+
+df_24_cp$Y <- factor(df_24_cp$Y, levels = c("Negativo", "Positivo"))
+
+ind_coords_24_cp <- as.data.frame(get_famd_ind(res.famd24_cp)$coord[, 1:2])
+colnames(ind_coords_24_cp) <- c("Dim1", "Dim2")
+
+# Usar Y desde el objeto FAMD si está disponible; si no, desde df_24_cp
+if ("Y" %in% names(res.famd24_cp$call$X)) {
+  ind_coords_24_cp$SAA <- res.famd24_cp$call$X[["Y"]]
+} else {
+  ind_coords_24_cp$SAA <- df_24_cp$Y
+}
+
+ind_coords_24_cp$SAA <- factor(ind_coords_24_cp$SAA, levels = c("Negativo", "Positivo"))
+
+quanti_coords_24_cp <- as.data.frame(res.famd24_cp$quanti.var$coord[, 1:2])
+colnames(quanti_coords_24_cp) <- c("Dim1", "Dim2")
+quanti_coords_24_cp$variable <- rownames(quanti_coords_24_cp)
+
+scale_factor_24_cp <- max(abs(ind_coords_24_cp[, 1:2]), na.rm = TRUE) * 0.8
+quanti_coords_24_cp[, 1:2] <- quanti_coords_24_cp[, 1:2] * scale_factor_24_cp
+
+quali_coords_24_cp <- obtener_quali_coords_famd(res.famd24_cp)
+
+eig_24_cp <- get_eigenvalue(res.famd24_cp)
+
+ggplot() +
+  geom_point(
+    data = ind_coords_24_cp,
+    aes(x = Dim1, y = Dim2, color = SAA),
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  scale_color_manual(
+    values = c("Negativo" = "#FC4E07", "Positivo" = "#00AFBB"),
+    name = "Estado SAA",
+    drop = FALSE
+  ) +
+  geom_segment(
+    data = quanti_coords_24_cp,
+    aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "#1F3864",
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = quanti_coords_24_cp,
+    aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+    color = "#1F3864",
+    size = 3,
+    fontface = "bold"
+  ) +
+  geom_point(
+    data = quali_coords_24_cp,
+    aes(x = Dim1, y = Dim2),
+    shape = 17,
+    size = 1.5,
+    color = "#C00000"
+  ) +
+  geom_text_repel(
+    data = quali_coords_24_cp,
+    aes(x = Dim1, y = Dim2, label = categoria),
+    color = "#C00000",
+    size = 3,
+    max.overlaps = 15
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(
+    title = "Biplot FAMD - Control positivo 24h",
+    x = paste0("Dim1 (", round(eig_24_cp[1, 2], 1), "%)"),
+    y = paste0("Dim2 (", round(eig_24_cp[2, 2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Biplot FAMD - Control positivo 150h
+
+# Asegurar que Y existe si estás ejecutando chunks sueltos
+if (!"Y" %in% names(df_150_cp) && "estado SAA" %in% names(df_150_cp)) {
+  df_150_cp$Y <- df_150_cp$`estado SAA`
+  df_150_cp$`estado SAA` <- NULL
+}
+
+df_150_cp$Y <- factor(df_150_cp$Y, levels = c("Negativo", "Positivo"))
+
+ind_coords_150_cp <- as.data.frame(get_famd_ind(res.famd150_cp)$coord[, 1:2])
+colnames(ind_coords_150_cp) <- c("Dim1", "Dim2")
+
+# Usar Y desde el objeto FAMD si está disponible; si no, desde df_150_cp
+if ("Y" %in% names(res.famd150_cp$call$X)) {
+  ind_coords_150_cp$SAA <- res.famd150_cp$call$X[["Y"]]
+} else {
+  ind_coords_150_cp$SAA <- df_150_cp$Y
+}
+
+ind_coords_150_cp$SAA <- factor(ind_coords_150_cp$SAA, levels = c("Negativo", "Positivo"))
+
+quanti_coords_150_cp <- as.data.frame(res.famd150_cp$quanti.var$coord[, 1:2])
+colnames(quanti_coords_150_cp) <- c("Dim1", "Dim2")
+quanti_coords_150_cp$variable <- rownames(quanti_coords_150_cp)
+
+scale_factor_150_cp <- max(abs(ind_coords_150_cp[, 1:2]), na.rm = TRUE) * 0.8
+quanti_coords_150_cp[, 1:2] <- quanti_coords_150_cp[, 1:2] * scale_factor_150_cp
+
+quali_coords_150_cp <- obtener_quali_coords_famd(res.famd150_cp)
+
+eig_150_cp <- get_eigenvalue(res.famd150_cp)
+
+ggplot() +
+  geom_point(
+    data = ind_coords_150_cp,
+    aes(x = Dim1, y = Dim2, color = SAA),
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  scale_color_manual(
+    values = c("Negativo" = "#FC4E07", "Positivo" = "#00AFBB"),
+    name = "Estado SAA",
+    drop = FALSE
+  ) +
+  geom_segment(
+    data = quanti_coords_150_cp,
+    aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "#1F3864",
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = quanti_coords_150_cp,
+    aes(x = Dim1 * 1.1, y = Dim2 * 1.1, label = variable),
+    color = "#1F3864",
+    size = 3,
+    fontface = "bold"
+  ) +
+  geom_point(
+    data = quali_coords_150_cp,
+    aes(x = Dim1, y = Dim2),
+    shape = 17,
+    size = 1.5,
+    color = "#C00000"
+  ) +
+  geom_text_repel(
+    data = quali_coords_150_cp,
+    aes(x = Dim1, y = Dim2, label = categoria),
+    color = "#C00000",
+    size = 3,
+    max.overlaps = 15
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  labs(
+    title = "Biplot FAMD - Control positivo 150h",
+    x = paste0("Dim1 (", round(eig_150_cp[1, 2], 1), "%)"),
+    y = paste0("Dim2 (", round(eig_150_cp[2, 2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+
+
+```{r, fig.width=8.0, fig.height=3.8}
+# grupo de estudio 24h
+p1_cp <- fviz_famd_ind(
+  res.famd24_cp,
+  habillage = "grupo de estudio",
+  palette = c("#E63946", "#00AFBB"),
+  addEllipses = TRUE, ellipse.type = "confidence",
+  geom = "point", repel = FALSE) +
+  ggtitle("Diagnóstico clínico (grupo de estudio) - CP 24h") +
+  theme(legend.position = "right", legend.text = element_text(size = 7), legend.key.size = unit(0.3, "cm"))
+p1_cp$layers[[1]] <- NULL
+p1_cp <- add_group_labels(p1_cp, res.famd24_cp, "grupo de estudio")
+
+# SAA status 24h
+p3_cp <- fviz_famd_ind(
+  res.famd24_cp,
+  habillage = "Y",
+  palette = c("#FC4E07", "#4CAF50"),
+  addEllipses = TRUE, ellipse.type = "confidence",
+  geom = "point", repel = FALSE) +
+  ggtitle("SAA status - CP 24h") +
+  theme(legend.position = "right", legend.text = element_text(size = 7), legend.key.size = unit(0.3, "cm"))
+p3_cp$layers[[1]] <- NULL
+p3_cp <- add_group_labels(p3_cp, res.famd24_cp, "Y")
+
+# grupo de estudio 150h
+p1_150_cp <- fviz_famd_ind(
+  res.famd150_cp,
+  habillage = "grupo de estudio",
+  palette = c("#E63946", "#00AFBB"),
+  addEllipses = TRUE, ellipse.type = "confidence",
+  geom = "point", repel = FALSE) +
+  ggtitle("Diagnóstico clínico (grupo de estudio) - CP 150h") +
+  theme(legend.position = "right", legend.text = element_text(size = 7), legend.key.size = unit(0.3, "cm"))
+p1_150_cp$layers[[1]] <- NULL
+p1_150_cp <- add_group_labels(p1_150_cp, res.famd150_cp, "grupo de estudio")
+
+# SAA status 150h
+p3_150_cp <- fviz_famd_ind(
+  res.famd150_cp,
+  habillage = "Y",
+  palette = c("#FC4E07", "#4CAF50"),
+  addEllipses = TRUE, ellipse.type = "confidence",
+  geom = "point", repel = FALSE) +
+  ggtitle("SAA status - CP 150h") +
+  theme(legend.position = "right", legend.text = element_text(size = 7), legend.key.size = unit(0.3, "cm"))
+p3_150_cp$layers[[1]] <- NULL
+p3_150_cp <- add_group_labels(p3_150_cp, res.famd150_cp, "Y")
+
+
+
+# Panel final
+(p1_cp | p3_cp) /
+(p1_150_cp | p3_150_cp)
+```
+
