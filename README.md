@@ -72,11 +72,10 @@ Integration of multiple PPMI/AMP-PD tables into a single analysis-ready dataset:
 
 ## Key results
 
-<!-- TODO (David): rellena con tus cifras reales del TFM. No las he inventado a propósito. -->
-- Sample sizes: 24 h protocol = **[N]** participants; 150 h protocol = **[N]** participants.
-- Random Forest balanced accuracy (test set): **[valor]**.
-- Most influential features by SHAP: **[lista tus top features]**.
-- Main contrast between the 24 h and 150 h protocols: **[1–2 frases con tu conclusión]**.
+- Sample sizes: 24 h protocol = **231** participants; 150 h protocol = **810** participants.
+- Random Forest accuracy (test set): **0.86**.
+- Most influential features by SHAP: **(MDS-UPDRS-III Score, Hoehn & Yahr stage, LRRK2 Mutation)**.
+- Main contrast between the 24 h and 150 h protocols: **The 150h protocol for the $\alpha$Syn-SAA assay generally provides a tighter distinction between positive and negative SAA status.**.
 
 ---
 
@@ -92,4 +91,6 @@ See `requirements.txt` for the Python environment.
 ## Author
 
 **David Palomino Plantón** — MSc in Bioinformatics, University of Murcia.
-<!-- TODO: añade aquí tu LinkedIn y/o email si quieres que te contacten desde el repo. -->
+
+Email: davidpalplanton@gmail.com
+LinkedIn: www.linkedin.com/in/davidpalplanton
