@@ -74,7 +74,7 @@ Integration of multiple PPMI/AMP-PD tables into a single analysis-ready dataset:
 
 - Sample sizes: 24 h protocol = **231** participants; 150 h protocol = **810** participants.
 - Random Forest accuracy (test set): **0.86**.
-- Most influential features by SHAP: **(MDS-UPDRS-III Score, Hoehn & Yahr stage, LRRK2 Mutation)**.
+- Most influential features by SHAP: **MDS-UPDRS-III Score, Hoehn & Yahr stage, LRRK2 Mutation**.
 - Main contrast between the 24 h and 150 h protocols: **The 150h protocol for the $\alpha$Syn-SAA assay generally provides a tighter distinction between positive and negative SAA status.**.
 
 ---
